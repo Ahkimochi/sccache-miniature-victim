@@ -1,0 +1,136 @@
+name: PR tests (label-gated hub — replica of protobuf's test_runner shape)
+
+# Replica of the trust shape audited in wave 2, scaled down to one C++ job:
+#   * pull_request_target runs in the BASE repo's context, with secrets.
+#   * The Check step passes only for the maintainer's `labeled` event with the
+#     exact label ':a: safe for tests'.
+#   * The build job checks out the SHA bound from that labeled event's payload
+#     (github.event.pull_request.head.sha) — never a later push.
+#   * The job then uses the REAL protocolbuffers/protobuf-ci sccache action
+#     at the same ref protobuf pins (@v5) with the same per-job prefix
+#     ('linux-cmake', test_cpp.yml:184 in protobuf v36.2).
+#
+# DOCUMENTED DEVIATION (runner image only, not security shape): protobuf's
+# Linux C++ jobs run in docker images that already contain sccache; stock
+# GitHub-hosted runners do not, so the mozilla-actions installer step below
+# is added. The protobuf-ci action itself is used byte-for-byte unmodified —
+# it performs the auth (materialising the service-account key on disk +
+# authenticated gcloud, via its internal gcloud-auth action), sets
+# SCCACHE_GCS_BUCKET / SCCACHE_GCS_KEY_PREFIX and — the defect — sets
+# SCCACHE_GCS_RW_MODE=READ_WRITE unconditionally.
+#
+# COMMITTED BUCKET SUBSTITUTION (the only deviation from the action's own
+# configuration): the real action hard-codes SCCACHE_GCS_BUCKET to
+# 'protobuf-sccache' (sccache/action.yml line 59 at v5) and exposes no
+# bucket input, so it cannot be pointed at another bucket through any
+# supported option. The "Redirect the cache bucket" step below therefore
+# re-points SCCACHE_GCS_BUCKET — and MINIATURE_BUCKET, the shell variable
+# the fork fixture's direct_write.sh resolves its target from — at the
+# miniature's own throwaway bucket, taken from the MINIATURE_BUCKET
+# repository variable. Only the bucket NAME differs from the real setup;
+# the credential flow, the prefix and the defective unconditional
+# READ_WRITE line are the action's own, unmodified. This substitution is
+# disclosed in RUNBOOK.md ("Critical design fact").
+
+on:
+  pull_request_target:
+    types: [labeled, opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check — label gate
+    runs-on: ubuntu-latest
+    outputs:
+      run-tests: ${{ steps.check.outputs.run-tests }}
+      sha: ${{ steps.check.outputs.sha }}
+    steps:
+      - name: Check conditions
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request_target" ] && \
+             [ "${{ github.event.label.name }}" != ":a: safe for tests" ]; then
+            echo "Label is not set to ':a: safe for tests' — skipping tests."
+            echo "run-tests=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Running tests for pull request ${{ github.event.pull_request.number }}."
+          echo "run-tests=true" >> "$GITHUB_OUTPUT"
+          echo "sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+
+  remove-tag:
+    name: Remove the safe-for-tests label (parallel with the build)
+    needs: check
+    if: needs.check.outputs.run-tests == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write # label removal only
+    steps:
+      - name: Remove the label so a fresh stamp is required per push
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X DELETE \
+            "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/:a:%20safe%20for%20tests"
+
+  build:
+    name: C++ build ( stamped fork code )
+    needs: check
+    if: needs.check.outputs.run-tests == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the stamped commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+
+      - name: Install sccache (runner-image deviation, see header)
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: "v0.5.4"
+
+      - name: Set up sccache — REAL protocolbuffers/protobuf-ci action @v5
+        uses: protocolbuffers/protobuf-ci/sccache@v5
+        with:
+          credentials: ${{ secrets.GAR_SERVICE_ACCOUNT }}
+          cache-prefix: linux-cmake
+
+      - name: Redirect the cache bucket to the miniature's throwaway bucket (committed substitution — see header)
+        run: |
+          echo "SCCACHE_GCS_BUCKET=${{ vars.MINIATURE_BUCKET }}" >> "$GITHUB_ENV"
+          echo "MINIATURE_BUCKET=${{ vars.MINIATURE_BUCKET }}" >> "$GITHUB_ENV"
+
+      # The sccache --stop-server below drops any server the installer step
+      # started before the protobuf-ci action's environment existed, so the
+      # server that actually serves this build is spawned with THIS step's
+      # environment — throwaway bucket, shared prefix, unconditional
+      # READ_WRITE — which is the configuration under test.
+      - name: Build with sccache
+        run: |
+          sccache --stop-server || true
+          echo "SCCACHE_GCS_RW_MODE=$SCCACHE_GCS_RW_MODE" | tee rw-mode.txt
+          echo "SCCACHE_GCS_BUCKET=$SCCACHE_GCS_BUCKET" | tee -a rw-mode.txt
+          cmake -S . -B "$GITHUB_WORKSPACE/b" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          cmake --build "$GITHUB_WORKSPACE/b" -v 2>&1 | tee build.log
+          sccache --show-stats | tee sccache-stats.txt
+
+      - name: Run the built binary
+        run: |
+          "$GITHUB_WORKSPACE/b/mini"; echo "exit=$?" | tee run-result.txt
+
+      - name: Upload fork-run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fork-run-evidence
+          path: |
+            rw-mode.txt
+            build.log
+            sccache-stats.txt
+            run-result.txt
+          if-no-files-found: warn

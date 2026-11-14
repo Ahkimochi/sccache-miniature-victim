@@ -1,0 +1,95 @@
+name: Trusted build (push to main — restore side)
+
+# The "trusted run" of the miniature: a push-to-main build of the SAME tree,
+# with the SAME sccache configuration protobuf uses for its postsubmit /
+# continuous runs — same real action (@v5), same bucket, same static prefix
+# ('linux-cmake'). Whatever the stamped fork run planted under that prefix
+# is what this job restores. The proof is in the outputs:
+#   * sccache stats must show a remote-cache hit with zero local compiles
+#     for marker.cpp, and
+#   * ./b/mini must print/exit with the value produced by the restored
+#     object — not by compiling the marker.cpp in this checkout.
+#
+# The committed bucket substitution described in the hub workflow's header
+# applies here identically: the "Redirect the cache bucket" step after the
+# action step re-points SCCACHE_GCS_BUCKET at the miniature's throwaway
+# bucket (MINIATURE_BUCKET repository variable), because the real action
+# hard-codes 'protobuf-sccache' and offers no bucket input. Only the
+# bucket name differs; the defective unconditional READ_WRITE
+# configuration is the action's own.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: C++ build (trusted)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+
+      - name: Show the reviewed source being "built"
+        run: |
+          echo "marker.cpp in this checkout:"; cat marker.cpp
+          sha256sum marker.cpp main.cpp | tee source-hashes.txt
+
+      - name: Install sccache (runner-image deviation, see hub workflow header)
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: "v0.5.4"
+
+      - name: Set up sccache — REAL protocolbuffers/protobuf-ci action @v5
+        uses: protocolbuffers/protobuf-ci/sccache@v5
+        with:
+          credentials: ${{ secrets.GAR_SERVICE_ACCOUNT }}
+          cache-prefix: linux-cmake
+
+      - name: Redirect the cache bucket to the miniature's throwaway bucket (committed substitution — see header)
+        run: |
+          echo "SCCACHE_GCS_BUCKET=${{ vars.MINIATURE_BUCKET }}" >> "$GITHUB_ENV"
+          echo "MINIATURE_BUCKET=${{ vars.MINIATURE_BUCKET }}" >> "$GITHUB_ENV"
+
+      # --stop-server: see the hub workflow — the server serving this build
+      # must be spawned with this step's environment, not the installer's.
+      - name: Build with sccache
+        run: |
+          sccache --stop-server || true
+          echo "effective SCCACHE_GCS_BUCKET=$SCCACHE_GCS_BUCKET SCCACHE_GCS_RW_MODE=$SCCACHE_GCS_RW_MODE SCCACHE_GCS_KEY_PREFIX=$SCCACHE_GCS_KEY_PREFIX"
+          cmake -S . -B "$GITHUB_WORKSPACE/b" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          cmake --build "$GITHUB_WORKSPACE/b" -v 2>&1 | tee build.log
+          sccache --show-stats | tee sccache-stats.txt
+
+      - name: Run the built binary — THE POISON CHECK
+        run: |
+          set +e
+          "$GITHUB_WORKSPACE/b/mini"; rc=$?
+          echo "MARKER exit code: $rc" | tee run-result.txt
+          if [ "$rc" = "42" ]; then
+            echo "POISONED-OBJECT-RESTORED: trusted run executed the fork's object (expected value was 7)" | tee -a run-result.txt
+          elif [ "$rc" = "7" ]; then
+            echo "CLEAN: trusted run produced the reviewed result (7)" | tee -a run-result.txt
+          else
+            echo "UNEXPECTED RESULT: $rc" | tee -a run-result.txt
+          fi
+          exit 0
+
+      - name: Upload trusted-run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trusted-run-evidence
+          path: |
+            source-hashes.txt
+            build.log
+            sccache-stats.txt
+            run-result.txt
+          if-no-files-found: warn
